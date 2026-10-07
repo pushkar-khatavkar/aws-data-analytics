@@ -1,0 +1,691 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudKida Lab - AWS for Data Analytics (Serverless, Fundamental).
+  Provisions the complete starting environment a learner needs for the
+  4-hour "AWS for Data Analytics" hands-on session:
+    (1) An S3 data-lake bucket (raw / processed / athena-results layout).
+    (2) A Glue Data Catalog database for the taxi tables.
+    (3) An Athena workgroup with a results location + a data-scan cost cap.
+    (4) A pre-created Glue crawler IAM role (so students need no IAM-create perms).
+    (5) A region-locked student IAM user whose permissions are scoped to exactly
+        the S3 / Glue / Athena actions the lab guide requires - nothing more.
+  The learner performs: upload CSVs to S3, create+run a Glue crawler, query with
+  Athena, build a CTAS "processed" layer, export results, then clean up.
+
+# ---------------------------------------------------------------------------
+# DESIGN PRINCIPLES
+#
+# MUST pre-create (so the student needs no admin / IAM-create permissions):
+#   - DataLakeBucket                (student only uploads/queries objects)
+#   - GlueDatabase                  (student only creates tables inside it)
+#   - AthenaWorkGroup               (results location + 200 MB scan cap preset)
+#   - GlueCrawlerRole               (student passes this role to the crawler)
+#   - Student IAM user + access key (CloudKida contract)
+#
+# MUST NOT pre-create (these are the learner's hands-on work):
+#   - Glue crawler  (student creates in Hour 3)
+#   - Glue tables   (crawler creates them: trips / zones / payments)
+#   - CTAS table    (student creates daily_revenue_summary in Hour 4)
+#   - Objects in the bucket (student uploads the 3 CSVs in Hour 2)
+#
+# CLOUDKIDA CONTRACT
+#   The platform passes ONLY two stack parameters: Password and Username.
+#   Any additional parameter causes CloudKida to reject the deployment before
+#   CloudFormation runs. Therefore the "student id" is NOT a parameter - every
+#   lab account is already isolated, so resource names are made unique with
+#   ${AWS::AccountId} and a fixed lab label. The outputs expose AccountId,
+#   AccessKey and SecretKey exactly as the platform expects.
+#
+# LEAST PRIVILEGE
+#   The student policy grants only the S3 (one bucket), Glue (catalog + crawler
+#   lifecycle), Athena (workgroup query lifecycle) and iam:PassRole (one role)
+#   actions the lab guide uses - all pinned to the deploy region. A permission
+#   boundary hard-denies everything outside the region plus billing/IAM-escape,
+#   and a cost-control policy blocks any accidental expensive resource creation.
+#
+# REGION (IMPORTANT)
+#   CloudKida runs CloudFormation in its home region: Mumbai / ap-south-1.
+#   Therefore EVERY resource this template creates (S3 bucket, Glue database,
+#   Athena workgroup, Glue role) is created in ap-south-1, and the student
+#   region lock (!Ref AWS::Region) resolves to ap-south-1. The student MUST
+#   work in ap-south-1 (Mumbai) - that is where their resources live and the
+#   only region their IAM user is allowed to act in. The template is
+#   region-agnostic (no hardcoded region), so if CloudKida ever changes its
+#   home region the lock follows automatically. The student guide must tell
+#   learners to select Mumbai / ap-south-1 in the console, NOT us-east-1.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Password:
+    Type: String
+    NoEcho: 'true'
+    Description: Console login password for the created student IAM user
+    MinLength: 8
+    MaxLength: 41
+    ConstraintDescription: Password must be between 8 and 41 characters
+  Username:
+    Type: String
+    NoEcho: 'false'
+    Default: 'student'
+    Description: Student IAM username to create
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+  # LabLabel is intentionally NOT a parameter. CloudKida only passes Password
+  # and Username; extra parameters make the platform reject the deployment.
+  # The lab label is fixed below and uniqueness comes from ${AWS::AccountId}.
+
+Mappings:
+  LabConfig:
+    Naming:
+      # Fixed label used in resource names. Each CloudKida lab runs in its own
+      # isolated account, so ${AWS::AccountId} already guarantees global
+      # uniqueness for the (globally-unique) S3 bucket name.
+      Label: 'student01'
+    Cost:
+      # Per-query Athena data-scan cap in bytes (200 MB). The sample dataset is
+      # tiny so real lab queries pass; this only blocks runaway scans.
+      AthenaBytesScannedCap: '200000000'
+
+Resources:
+
+  # =========================================================================
+  # SECTION A - S3 DATA-LAKE BUCKET
+  #
+  # Single bucket with the raw/ processed/ athena-results/ layout the lab uses.
+  # - Public access fully blocked.
+  # - SSE-S3 (AES256) default encryption.
+  # - Lifecycle rule auto-expires Athena query results after 7 days so the
+  #   bucket stays tidy and cheap even if cleanup is skipped.
+  # DeletionPolicy: Delete so the CloudKida teardown removes it with the stack
+  # (the bucket must be emptied first - see testing guide cleanup).
+  # =========================================================================
+  DataLakeBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub
+        - 'aws-analytics-lab-${Label}-${AWS::AccountId}'
+        - Label: !FindInMap [LabConfig, Naming, Label]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAthenaResults
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: aws-data-analytics-session
+        - Key: Lab
+          Value: !FindInMap [LabConfig, Naming, Label]
+
+  # =========================================================================
+  # SECTION B - GLUE DATA CATALOG DATABASE
+  #
+  # The logical database the Glue crawler writes the 3 detected tables into
+  # (trips / zones / payments) and that Athena queries against.
+  # =========================================================================
+  GlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub
+          - 'taxi_analytics_${Label}'
+          - Label: !FindInMap [LabConfig, Naming, Label]
+        Description: 'NYC taxi analytics database for the hands-on session'
+
+  # =========================================================================
+  # SECTION C - ATHENA WORKGROUP
+  #
+  # Preconfigured results location + a per-query scan cap (cost guardrail).
+  # EnforceWorkGroupConfiguration is FALSE on purpose so the Hour-4 CTAS can
+  # write to a custom external_location (processed/) while the scan cap still
+  # applies. RecursiveDeleteOption lets teardown remove it cleanly.
+  # =========================================================================
+  AthenaWorkGroup:
+    Type: 'AWS::Athena::WorkGroup'
+    Properties:
+      Name: !Sub
+        - 'analytics-lab-${Label}'
+        - Label: !FindInMap [LabConfig, Naming, Label]
+      Description: 'Workgroup for the AWS Data Analytics hands-on session'
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: !FindInMap [LabConfig, Cost, AthenaBytesScannedCap]
+        ResultConfiguration:
+          OutputLocation: !Sub
+            - 's3://aws-analytics-lab-${Label}-${AWS::AccountId}/athena-results/'
+            - Label: !FindInMap [LabConfig, Naming, Label]
+
+  # =========================================================================
+  # SECTION D - GLUE CRAWLER ROLE
+  #
+  # Role the student selects when creating the crawler in Hour 3. It is
+  # pre-created so the student needs NO iam:CreateRole permission. It can only
+  # read/write THIS lab bucket plus the AWS-managed Glue service role for the
+  # catalog write-back. The student is granted iam:PassRole on just this ARN.
+  # =========================================================================
+  GlueCrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub
+        - 'analytics-lab-glue-role-${Label}'
+        - Label: !FindInMap [LabConfig, Naming, Label]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:s3:::aws-analytics-lab-${Label}-${AWS::AccountId}'
+                    - Label: !FindInMap [LabConfig, Naming, Label]
+                  - !Sub
+                    - 'arn:${AWS::Partition}:s3:::aws-analytics-lab-${Label}-${AWS::AccountId}/*'
+                    - Label: !FindInMap [LabConfig, Naming, Label]
+
+  # =========================================================================
+  # SECTION E - CLOUDKIDA SANDBOX GUARDRAILS
+  #
+  # GeneralPurposePermissionBoundary: hard region lock (deploy region only),
+  #   billing/marketplace block, boundary-tamper block, broad-managed-policy
+  #   attachment block. Applied to the student as a PermissionsBoundary so it
+  #   constrains every granted action regardless of the lab policy.
+  #
+  # CostControlPolicy: this is a serverless lab (no EC2), so the guard blocks
+  #   any accidental compute/purchase that a stray permission might allow.
+  #   Retained as defence-in-depth even though the lab grants no ec2:RunInstances.
+  # =========================================================================
+  GeneralPurposePermissionBoundary:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-GeneralPermissionBoundary'
+      Description: 'Permission boundary - region lock (deploy region) and IAM safeguards'
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow all actions in the deploy region (the boundary is a ceiling;
+          # the lab policy below is what actually grants access).
+          - Sid: AllowInDeployRegion
+            Effect: Allow
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref 'AWS::Region'
+
+          # Hard deny for anything outside the deploy region.
+          #
+          # IMPORTANT: global services (IAM, STS) are reached through a global
+          # endpoint and report aws:RequestedRegion = us-east-1, NOT the deploy
+          # region. Without the NotAction exclusion below, this Deny would fire
+          # on every iam:* / sts:* call (an explicit Deny always wins over the
+          # AllowGlobalIAMAndSTS statement) - which breaks the Glue "create
+          # crawler" role dropdown (iam:ListRoles) and iam:PassRole. Excluding
+          # iam:* and sts:* here lets those region-agnostic calls through while
+          # still hard-locking every regional service to the deploy region.
+          - Sid: DenyOutsideDeployRegion
+            Effect: Deny
+            NotAction:
+              - 'iam:*'
+              - 'sts:*'
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                aws:RequestedRegion: !Ref 'AWS::Region'
+
+          # Global (region-agnostic) services the lab still needs: IAM read-only,
+          # PassRole (scoped elsewhere), and STS identity. These are allowed with
+          # no region condition because IAM/STS calls do not carry the deploy
+          # region in aws:RequestedRegion.
+          - Sid: AllowGlobalIAMAndSTS
+            Effect: Allow
+            Action:
+              - 'iam:Get*'
+              - 'iam:List*'
+              - 'iam:PassRole'
+              - 'sts:GetCallerIdentity'
+            Resource: '*'
+
+          # Block billing / cost-management / marketplace entirely.
+          - Sid: DenyBilling
+            Effect: Deny
+            Action:
+              - 'account:*'
+              - 'aws-portal:*'
+              - 'savingsplans:*'
+              - 'cur:*'
+              - 'ce:*'
+              - 'aws-marketplace:*'
+              - 'pricing:*'
+              - 'budgets:*'
+              - 'billing:*'
+              - 'purchase-orders:*'
+              - 'freetier:*'
+              - 'tax:*'
+            Resource: '*'
+
+          # Prevent the student from removing/altering their own boundary.
+          - Sid: DenyBoundaryTampering
+            Effect: Deny
+            Action:
+              - 'iam:DeleteRolePermissionsBoundary'
+              - 'iam:DeleteUserPermissionsBoundary'
+              - 'iam:PutUserPermissionsBoundary'
+              - 'iam:PutRolePermissionsBoundary'
+            Resource: '*'
+
+          # Prevent attaching broad AWS-managed policies (privilege escalation).
+          - Sid: DenyBroadManagedPolicyAttachment
+            Effect: Deny
+            Action:
+              - 'iam:AttachRolePolicy'
+              - 'iam:AttachUserPolicy'
+              - 'iam:AttachGroupPolicy'
+            Resource: '*'
+            Condition:
+              StringLike:
+                iam:PolicyArn:
+                  - '*AdministratorAccess*'
+                  - '*PowerUserAccess*'
+                  - '*IAMFullAccess*'
+                  - '*AmazonS3FullAccess*'
+                  - '*AWSGlueConsoleFullAccess*'
+                  - '*AmazonAthenaFullAccess*'
+
+  CostControlPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-CostControlPolicy'
+      Description: 'Cost controls - block compute/purchases in this serverless-only lab'
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Serverless lab: the student never launches EC2. Block it outright
+          # so a stray permission cannot spin up compute.
+          - Sid: DenyAllEC2RunInstances
+            Effect: Deny
+            Action:
+              - 'ec2:RunInstances'
+              - 'ec2:CreateVolume'
+            Resource: '*'
+
+          # Block paid compute purchase mechanisms.
+          - Sid: DenyPurchases
+            Effect: Deny
+            Action:
+              - 'ec2:AllocateHosts'
+              - 'ec2:PurchaseHostReservation'
+              - 'ec2:PurchaseReservedInstancesOffering'
+              - 'ec2:RequestSpotFleet'
+              - 'ec2:RequestSpotInstances'
+              - 'savingsplans:*'
+            Resource: '*'
+
+  # =========================================================================
+  # SECTION F - LEARNER LAB PERMISSIONS
+  #
+  # Scoped exactly to the lab guide workflow:
+  #   Hour 2  : upload the 3 CSVs to S3 and browse the bucket.
+  #   Hour 3  : create + run a Glue crawler -> 3 tables; query with Athena.
+  #   Hour 4  : analytical queries + CTAS to processed/ ; export results.
+  #   Cleanup : drop CTAS table, delete crawler/tables, empty bucket.
+  #
+  # Everything is pinned to the deploy region (except unavoidably-global IAM
+  # read-only, PassRole and STS). S3 is pinned to the single lab bucket.
+  # =========================================================================
+  DataAnalyticsLabPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-DataAnalyticsLabPolicy'
+      Description: >-
+        Least-privilege S3/Glue/Athena permissions required to complete the
+        AWS Data Analytics lab. Region-locked and bucket-scoped.
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # ------------------------------------------------------------------
+          # S3 - list all buckets (console landing page needs this) + read the
+          # account-level public access block the console renders.
+          # ------------------------------------------------------------------
+          - Sid: S3ConsoleGlobalReadOnly
+            Effect: Allow
+            Action:
+              - 's3:ListAllMyBuckets'
+              - 's3:GetBucketLocation'
+              - 's3:GetAccountPublicAccessBlock'
+            Resource: '*'
+
+          # ------------------------------------------------------------------
+          # S3 - full object lifecycle on ONLY the lab bucket. Covers Hour-2
+          # folder creation + uploads, Athena reading data and writing results,
+          # CTAS writing Parquet to processed/, and the cleanup "empty bucket".
+          # ------------------------------------------------------------------
+          - Sid: S3LabBucketAccess
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetBucketPublicAccessBlock'
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:ListMultipartUploadParts'
+              - 's3:AbortMultipartUpload'
+            Resource:
+              - !Sub
+                - 'arn:${AWS::Partition}:s3:::aws-analytics-lab-${Label}-${AWS::AccountId}'
+                - Label: !FindInMap [LabConfig, Naming, Label]
+              - !Sub
+                - 'arn:${AWS::Partition}:s3:::aws-analytics-lab-${Label}-${AWS::AccountId}/*'
+                - Label: !FindInMap [LabConfig, Naming, Label]
+
+          # ------------------------------------------------------------------
+          # AWS Glue - crawler lifecycle (create / run / delete), catalog read,
+          # and table/database management (crawler + CTAS create tables; cleanup
+          # deletes them). Classifiers are read/created in case the student must
+          # fix a header-detection issue (see instructor pitfalls table).
+          # ------------------------------------------------------------------
+          - Sid: GlueCatalogAndCrawler
+            Effect: Allow
+            Action:
+              # ---- Data Catalog READ / DISCOVERY ----
+              # These back the Glue + Athena console left panel (database and
+              # table browser, search box) and Athena's table resolution. The
+              # Athena/Glue console calls glue:SearchTables to populate and
+              # filter the table list - without it the query editor throws
+              # "not authorized to perform glue:SearchTables". The full read
+              # set below is granted together so catalog browsing never fails
+              # on a single missing describe/search action.
+              - 'glue:GetDatabase'
+              - 'glue:GetDatabases'
+              - 'glue:GetTable'
+              - 'glue:GetTables'
+              - 'glue:GetTableVersion'
+              - 'glue:GetTableVersions'
+              - 'glue:SearchTables'
+              - 'glue:GetPartition'
+              - 'glue:GetPartitions'
+              - 'glue:BatchGetPartition'
+              - 'glue:GetColumnStatisticsForTable'
+              - 'glue:GetCatalogImportStatus'
+              - 'glue:GetDataCatalogEncryptionSettings'
+              - 'glue:GetUserDefinedFunction'
+              - 'glue:GetUserDefinedFunctions'
+              # ---- Data Catalog WRITE (crawler + CTAS create tables; cleanup) ----
+              - 'glue:CreateTable'
+              - 'glue:UpdateTable'
+              - 'glue:DeleteTable'
+              - 'glue:BatchDeleteTable'
+              - 'glue:CreateCrawler'
+              - 'glue:DeleteCrawler'
+              - 'glue:GetCrawler'
+              - 'glue:GetCrawlers'
+              - 'glue:StartCrawler'
+              - 'glue:StopCrawler'
+              - 'glue:UpdateCrawler'
+              - 'glue:ListCrawlers'
+              - 'glue:GetCrawlerMetrics'
+              # The modern Glue console "Crawlers" LIST page does not render
+              # from GetCrawlers/ListCrawlers alone - it calls ListCrawls and
+              # BatchGetCrawlers to show each crawler + its latest run status.
+              # Without these the list appears EMPTY even though the crawler
+              # exists. GetCrawlerIterationMetrics / ListCrawls back the run
+              # history and schedule columns.
+              - 'glue:ListCrawls'
+              - 'glue:BatchGetCrawlers'
+              - 'glue:GetCrawlerIterationMetrics'
+              # Classifiers used if the student must fix CSV header detection.
+              - 'glue:CreateClassifier'
+              - 'glue:GetClassifier'
+              - 'glue:GetClassifiers'
+              - 'glue:UpdateClassifier'
+              # Console side-panels on the crawler pages enumerate these.
+              - 'glue:ListConnections'
+              - 'glue:GetConnection'
+              - 'glue:GetConnections'
+              - 'glue:GetSecurityConfigurations'
+              - 'glue:TagResource'
+              - 'glue:GetTags'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref 'AWS::Region'
+
+          # ------------------------------------------------------------------
+          # Amazon Athena - run queries in the lab workgroup and read results.
+          # Covers Q1-Q9 and the CTAS statement. Pinned to the deploy region.
+          # ------------------------------------------------------------------
+          - Sid: AthenaQuery
+            Effect: Allow
+            Action:
+              - 'athena:StartQueryExecution'
+              - 'athena:StopQueryExecution'
+              - 'athena:GetQueryExecution'
+              - 'athena:GetQueryResults'
+              - 'athena:GetQueryResultsStream'
+              - 'athena:GetQueryRuntimeStatistics'
+              - 'athena:BatchGetQueryExecution'
+              - 'athena:ListQueryExecutions'
+              - 'athena:GetWorkGroup'
+              - 'athena:ListWorkGroups'
+              - 'athena:GetDataCatalog'
+              - 'athena:ListDataCatalogs'
+              - 'athena:GetDatabase'
+              - 'athena:ListDatabases'
+              - 'athena:ListTableMetadata'
+              - 'athena:GetTableMetadata'
+              - 'athena:ListEngineVersions'
+              - 'athena:GetNamedQuery'
+              - 'athena:ListNamedQueries'
+              - 'athena:CreateNamedQuery'
+              - 'athena:DeleteNamedQuery'
+              # Query editor init / "Prepared statements" panel calls these;
+              # denial throws console errors on editor load in some regions.
+              - 'athena:ListPreparedStatements'
+              - 'athena:GetPreparedStatement'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref 'AWS::Region'
+
+          # ------------------------------------------------------------------
+          # AWS Lake Formation - credential vending for Athena.
+          # If the account's Glue Data Catalog is governed by Lake Formation
+          # (increasingly the DEFAULT for new accounts/databases), every Athena
+          # query that reads a table requires lakeformation:GetDataAccess, or
+          # the query fails with an authorization error EVEN THOUGH all the Glue
+          # read permissions are present. The AWS-managed AmazonAthenaFullAccess
+          # policy includes this action for exactly this reason. It is harmless
+          # when Lake Formation is NOT in use, so it is granted defensively.
+          # ------------------------------------------------------------------
+          - Sid: LakeFormationDataAccess
+            Effect: Allow
+            Action:
+              - 'lakeformation:GetDataAccess'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref 'AWS::Region'
+
+          # ------------------------------------------------------------------
+          # IAM read-only - lets the student see the pre-created Glue role when
+          # choosing it in the crawler wizard. No IAM mutating actions granted.
+          # ------------------------------------------------------------------
+          - Sid: IAMReadOnlyVerification
+            Effect: Allow
+            Action:
+              - 'iam:Get*'
+              - 'iam:List*'
+            Resource: '*'
+
+          # ------------------------------------------------------------------
+          # STS - identity confirmation (CLI / console sanity check).
+          # ------------------------------------------------------------------
+          - Sid: STSCallerIdentity
+            Effect: Allow
+            Action:
+              - 'sts:GetCallerIdentity'
+            Resource: '*'
+
+  # ------------------------------------------------------------------
+  # PassRole - narrowly scoped so the student can hand ONLY the
+  # pre-created Glue crawler role to the Glue service when creating the
+  # crawler. PassRole on '*' is prohibited; this pins it to one ARN and
+  # the glue.amazonaws.com service.
+  # ------------------------------------------------------------------
+  StudentPassRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-StudentPassRoleForGlue'
+      Description: >-
+        Allows the student to pass only the lab Glue crawler role to the Glue
+        service. Scoped by resource ARN and iam:PassedToService condition.
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PassGlueCrawlerRoleToGlueOnly
+            Effect: Allow
+            Action: 'iam:PassRole'
+            Resource: !GetAtt GlueCrawlerRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: 'glue.amazonaws.com'
+
+  # =========================================================================
+  # SECTION G - STUDENT IAM USER + PROGRAMMATIC KEY (CloudKida contract)
+  #
+  # The student user carries:
+  #   - DataAnalyticsLabPolicy   (scoped S3/Glue/Athena actions)
+  #   - CostControlPolicy        (hard cost guardrails)
+  #   - StudentPassRolePolicy    (PassRole scoped to the Glue role)
+  #   - PermissionsBoundary      (region lock + IAM/billing safeguards)
+  # =========================================================================
+  student:
+    Type: 'AWS::IAM::User'
+    DependsOn:
+      - GeneralPurposePermissionBoundary
+    Properties:
+      UserName: !Ref Username
+      ManagedPolicyArns:
+        - !Ref DataAnalyticsLabPolicy
+        - !Ref CostControlPolicy
+        - !Ref StudentPassRolePolicy
+      PermissionsBoundary: !Ref GeneralPurposePermissionBoundary
+      Path: /
+      LoginProfile:
+        Password: !Ref Password
+        PasswordResetRequired: false
+
+  CFNKeys:
+    Type: 'AWS::IAM::AccessKey'
+    DependsOn:
+      - student
+    Properties:
+      UserName: !Ref student
+
+# =============================================================================
+# OUTPUTS - CloudKida platform contract
+# The platform reads AccountId, AccessKey, and SecretKey to hand the learner
+# their lab credentials. The remaining outputs help the student / instructor.
+# =============================================================================
+Outputs:
+  AccountId:
+    Value: !Sub '${AWS::AccountId}'
+    Description: AWS Account ID
+    Export:
+      Name: !Sub '${AWS::StackName}-AccountId'
+
+  AccountUser:
+    Value: !Ref student
+    Description: IAM username created for the learner
+    Export:
+      Name: !Sub '${AWS::StackName}-AccountUser'
+
+  AccessKey:
+    Value: !Ref CFNKeys
+    Description: AWS Access Key ID for programmatic access
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessKey'
+
+  SecretKey:
+    Value: !GetAtt [CFNKeys, SecretAccessKey]
+    Description: AWS Secret Access Key (store securely)
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretKey'
+
+  ConsoleLoginURL:
+    Value: !Sub 'https://${AWS::AccountId}.signin.aws.amazon.com/console'
+    Description: Console sign-in URL for the learner
+
+  AllowedRegion:
+    Value: !Ref 'AWS::Region'
+    Description: The region this lab deployed into (the only region the student may use)
+
+  BucketName:
+    Value: !Ref DataLakeBucket
+    Description: S3 data-lake bucket name (upload the dataset here)
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  RawDataPrefix:
+    Value: !Sub 's3://${DataLakeBucket}/raw/'
+    Description: Where the student uploads the raw CSVs (Hour 2)
+
+  ProcessedDataPrefix:
+    Value: !Sub 's3://${DataLakeBucket}/processed/'
+    Description: Where the Athena CTAS writes processed data (Hour 4)
+
+  AthenaResultsLocation:
+    Value: !Sub 's3://${DataLakeBucket}/athena-results/'
+    Description: Athena query results location (preconfigured on the workgroup)
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue Data Catalog database name (select this in Athena)
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+    Description: Athena workgroup to select in the Athena console
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroupName'
+
+  GlueCrawlerRoleArn:
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Description: IAM role ARN the student selects when creating the Glue crawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawlerRoleArn'
