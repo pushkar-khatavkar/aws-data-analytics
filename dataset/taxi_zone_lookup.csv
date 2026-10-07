@@ -1,0 +1,52 @@
+LocationID,Borough,Zone
+4,Manhattan,Alphabet City
+12,Manhattan,Battery Park
+13,Manhattan,Battery Park City
+24,Manhattan,Bloomingdale
+41,Manhattan,Central Harlem
+43,Manhattan,Central Park
+45,Manhattan,Chinatown
+48,Manhattan,Clinton East
+50,Manhattan,Clinton West
+68,Manhattan,East Chelsea
+79,Manhattan,East Village
+87,Manhattan,Financial District North
+90,Manhattan,Flatiron
+100,Manhattan,Garment District
+107,Manhattan,Gramercy
+113,Manhattan,Greenwich Village North
+125,Manhattan,Hudson Sq
+137,Manhattan,Kips Bay
+140,Manhattan,Lenox Hill East
+141,Manhattan,Lenox Hill West
+142,Manhattan,Lincoln Square East
+161,Manhattan,Midtown Center
+162,Manhattan,Midtown East
+163,Manhattan,Midtown North
+164,Manhattan,Midtown South
+170,Manhattan,Murray Hill
+186,Manhattan,Penn Station/Madison Sq West
+230,Manhattan,Times Sq/Theatre District
+234,Manhattan,Union Sq
+236,Manhattan,Upper East Side North
+237,Manhattan,Upper East Side South
+238,Manhattan,Upper West Side North
+239,Manhattan,Upper West Side South
+246,Manhattan,West Chelsea/Hudson Yards
+249,Manhattan,West Village
+7,Queens,Astoria
+70,Queens,East Elmhurst
+129,Queens,Jackson Heights
+132,Queens,JFK Airport
+138,Queens,LaGuardia Airport
+145,Queens,Long Island City/Hunters Point
+33,Brooklyn,Brooklyn Heights
+61,Brooklyn,Crown Heights North
+65,Brooklyn,Downtown Brooklyn/MetroTech
+76,Brooklyn,East New York
+255,Brooklyn,Williamsburg (North Side)
+3,Bronx,Allerton/Pelham Gardens
+18,Bronx,Bedford Park
+20,Bronx,Belmont
+5,Staten Island,Arden Heights
+6,Staten Island,Arrochar/Fort Wadsworth
