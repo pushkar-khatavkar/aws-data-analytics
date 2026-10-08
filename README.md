@@ -230,7 +230,9 @@ Then open **S3 → your bucket → `processed/daily_revenue/`** — you'll see t
 ### 4.3 Make a chart
 1. Run Q9's verify query (or Q4).
 2. In the Athena results panel → **Download results** (CSV).
-3. Open in **Excel / Google Sheets** → select the data → **Insert → Chart** (bar or line).
+3. Open in **Google Sheets** (Make A Copy of below sheet in your Account's Google Sheets)
+   
+**Link:** [Click Here](https://docs.google.com/spreadsheets/d/1XABF3umAwVCb8geM-rli2_N7_C9qBiZmxMOUPxxvQ-A/edit?usp=sharing)
 
 ![Download results and build a chart](images/4.3.1.png)
 
